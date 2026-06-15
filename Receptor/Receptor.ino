@@ -8,19 +8,13 @@
  * Funcao deste firmware:
  *   1) Escuta pacotes LoRa em 915 MHz vindos do transmissor (COM9).
  *   2) Decodifica o CSV recebido:
- *      seq;mq2_raw;mq2_ppm;mq7_raw;mq7_ppm;mq135_raw;mq135_ppm;temp;umid
- *   3) Mostra as ultimas leituras no OLED com RSSI e SNR do link.
- *   4) Replica tudo no Serial Monitor para integracao em PC / dashboard.
- *
- * Este receptor NAO precisa dos sensores conectados - apenas a placa
- * Heltec V2 com o OLED.
+ *        D;seq;mq2_raw;mq2_ppm;mq7_raw;mq7_ppm;mq135_raw;mq135_ppm;temp;umid
+ *   3) Mede RSSI e SNR locais e envia ACK ("A;seq;rssi;snr") de volta.
+ *   4) Mostra as ultimas leituras no OLED com barras de intensidade,
+ *      RSSI em dBm e SNR em dB.
  *
  * OLED Heltec V2:  SDA=4  SCL=15  RST=16  I2C=0x3C
  * LoRa  Heltec V2: SCK=5  MISO=19 MOSI=27 SS=18 RST=14 DIO0=26
- *
- * Bibliotecas:
- *   - Adafruit SSD1306, Adafruit GFX
- *   - LoRa (Sandeep Mistry)
  */
 
 #include <Wire.h>
@@ -29,7 +23,7 @@
 #include <Adafruit_SSD1306.h>
 #include <LoRa.h>
 
-// ===== OLED Heltec =====
+// ===== OLED =====
 #define OLED_SDA    4
 #define OLED_SCL    15
 #define OLED_RST    16
@@ -37,7 +31,7 @@
 #define SCREEN_HEIGHT 64
 #define OLED_ADDR   0x3C
 
-// ===== LoRa Heltec V2 =====
+// ===== LoRa =====
 #define LORA_SCK    5
 #define LORA_MISO   19
 #define LORA_MOSI   27
@@ -47,6 +41,7 @@
 #define LORA_FREQ   915E6
 #define LORA_SF     9
 #define LORA_BW     125E3
+#define LORA_TXPOW  14    // potencia menor para ACK (basta)
 #define LORA_SYNC   0xA5
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
@@ -65,7 +60,38 @@ Leitura ult = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false};
 uint32_t totalRecebidos = 0;
 unsigned long ultimoRxMs = 0;
 
-// ===== OLED helpers =====
+// ============================================================
+// Indicador de sinal
+// ============================================================
+
+int rssiParaBarras(int rssi, bool valido) {
+  if (!valido) return 0;
+  if (rssi >= -75)  return 4;
+  if (rssi >= -90)  return 3;
+  if (rssi >= -105) return 2;
+  if (rssi >= -120) return 1;
+  return 0;
+}
+
+void desenhaBarras(int x, int y_base, int bars) {
+  const int heights[4] = {3, 6, 9, 12};
+  const int bar_w = 3;
+  const int gap   = 1;
+  for (int i = 0; i < 4; i++) {
+    int bx = x + i * (bar_w + gap);
+    int bh = heights[i];
+    int by = y_base - bh;
+    if (i < bars) {
+      display.fillRect(bx, by, bar_w, bh, SSD1306_WHITE);
+    } else {
+      display.drawRect(bx, by, bar_w, bh, SSD1306_WHITE);
+    }
+  }
+}
+
+// ============================================================
+// OLED
+// ============================================================
 
 void mostraMsg(const char* l1, const char* l2 = "", const char* l3 = "", const char* l4 = "") {
   display.clearDisplay();
@@ -81,12 +107,10 @@ void mostraMsg(const char* l1, const char* l2 = "", const char* l3 = "", const c
 
 void inicializaOLED() {
   pinMode(21, OUTPUT);
-  digitalWrite(21, LOW);  // Vext ON (algumas variantes Heltec V2)
-  delay(50);
+  digitalWrite(21, LOW);  delay(50);
 
   pinMode(OLED_RST, OUTPUT);
-  digitalWrite(OLED_RST, LOW);
-  delay(20);
+  digitalWrite(OLED_RST, LOW);  delay(20);
   digitalWrite(OLED_RST, HIGH);
 
   Wire.begin(OLED_SDA, OLED_SCL);
@@ -106,14 +130,19 @@ void inicializaLoRa() {
   }
   LoRa.setSpreadingFactor(LORA_SF);
   LoRa.setSignalBandwidth(LORA_BW);
+  LoRa.setTxPower(LORA_TXPOW);
   LoRa.setSyncWord(LORA_SYNC);
   LoRa.enableCrc();
-  LoRa.receive();  // entra em modo escuta
+  LoRa.receive();
 }
 
-// ===== Decodificador CSV =====
+// ============================================================
+// Decodificador
+// ============================================================
 
-bool decodifica(const String& s, Leitura& l) {
+// Decodifica somente o corpo CSV (sem o prefixo "D;").
+// Formato: seq;mq2_raw;mq2_ppm;mq7_raw;mq7_ppm;mq135_raw;mq135_ppm;temp;umid
+bool decodificaCsv(const String& s, Leitura& l) {
   String parts[9];
   int idx = 0;
   int start = 0;
@@ -123,8 +152,8 @@ bool decodifica(const String& s, Leitura& l) {
       start = i + 1;
     }
   }
-  if (idx != 8) return false;          // precisa de 8 separadores
-  parts[idx] = s.substring(start);     // ultimo campo
+  if (idx != 8) return false;
+  parts[idx] = s.substring(start);
 
   l.seq       = (uint32_t)parts[0].toInt();
   l.mq2_raw   = parts[1].toInt();
@@ -139,19 +168,35 @@ bool decodifica(const String& s, Leitura& l) {
   return true;
 }
 
-// ===== Telas =====
+void enviaAck(uint32_t seq, int rssi, float snr) {
+  char ack[40];
+  snprintf(ack, sizeof(ack), "A;%lu;%d;%.1f", (unsigned long)seq, rssi, snr);
+  LoRa.beginPacket();
+  LoRa.print(ack);
+  LoRa.endPacket();
+  LoRa.receive();
+}
+
+// ============================================================
+// Telas
+// ============================================================
 
 void desenhaTelaDados() {
+  int barras = rssiParaBarras(ult.rssi, ult.valido);
+
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
+  // Cabecalho + barras
   display.setCursor(0, 0);
   display.print(F("RX #")); display.print(ult.seq);
-  display.print(F("  Tot:")); display.println(totalRecebidos);
-  display.drawLine(0, 9, SCREEN_WIDTH - 1, 9, SSD1306_WHITE);
+  display.print(F(" T:")); display.print(totalRecebidos);
+  desenhaBarras(111, 12, barras);
+  display.drawLine(0, 14, SCREEN_WIDTH - 1, 14, SSD1306_WHITE);
 
-  display.setCursor(0, 12);
+  // Dados
+  display.setCursor(0, 17);
   display.print(F("MQ2  ")); display.print(ult.mq2_raw);
   display.print(F(" ")); display.print(ult.mq2_ppm, 0); display.println(F("ppm"));
 
@@ -163,8 +208,12 @@ void desenhaTelaDados() {
 
   display.print(F("T:")); display.print(ult.temp, 1);
   display.print((char)247); display.print(F("C H:"));
-  display.print(ult.umid, 0); display.print(F("% "));
-  display.print(F("R")); display.print(ult.rssi);
+  display.print(ult.umid, 0); display.println(F("%"));
+
+  // Qualidade do enlace
+  display.setCursor(0, 56);
+  display.print(F("R:")); display.print(ult.rssi); display.print(F("dBm "));
+  display.print(F("S:")); display.print(ult.snr, 1); display.print(F("dB"));
   display.display();
 }
 
@@ -172,20 +221,24 @@ void desenhaTelaEspera() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
+
   display.setCursor(0, 0);
-  display.println(F("RECEPTOR LoRa"));
-  display.drawLine(0, 9, SCREEN_WIDTH - 1, 9, SSD1306_WHITE);
-  display.setCursor(0, 14);
+  display.print(F("RECEPTOR LoRa"));
+  desenhaBarras(111, 12, 0);
+  display.drawLine(0, 14, SCREEN_WIDTH - 1, 14, SSD1306_WHITE);
+
+  display.setCursor(0, 18);
   display.println(F("Aguardando pacotes"));
   display.println(F("do transmissor..."));
   display.println();
-  display.print(F("Freq: 915 MHz  SF:"));
-  display.println(LORA_SF);
-  display.print(F("Total: ")); display.println(totalRecebidos);
+  display.print(F("Freq: 915MHz SF:"));  display.println(LORA_SF);
+  display.print(F("Total RX: ")); display.println(totalRecebidos);
   display.display();
 }
 
-// ===== Setup =====
+// ============================================================
+// Setup / Loop
+// ============================================================
 
 void setup() {
   Serial.begin(115200);
@@ -202,38 +255,44 @@ void setup() {
   desenhaTelaEspera();
 }
 
-// ===== Loop =====
-
 void loop() {
   int tam = LoRa.parsePacket();
   if (tam > 0) {
     String recv;
     recv.reserve(tam + 1);
-    while (LoRa.available()) {
-      recv += (char)LoRa.read();
-    }
+    while (LoRa.available()) recv += (char)LoRa.read();
+
     int rssi = LoRa.packetRssi();
     float snr = LoRa.packetSnr();
 
     Serial.print(F("[RX] "));
     Serial.print(recv);
     Serial.print(F("  RSSI=")); Serial.print(rssi);
-    Serial.print(F(" dBm  SNR=")); Serial.println(snr, 1);
+    Serial.print(F("dBm  SNR=")); Serial.print(snr, 1); Serial.println(F("dB"));
 
-    Leitura l;
-    l.rssi = rssi;
-    l.snr  = snr;
-    if (decodifica(recv, l)) {
-      ult = l;
-      totalRecebidos++;
-      ultimoRxMs = millis();
-      desenhaTelaDados();
+    if (recv.startsWith("D;")) {
+      Leitura l;
+      l.rssi = rssi;
+      l.snr  = snr;
+      String corpo = recv.substring(2);
+      if (decodificaCsv(corpo, l)) {
+        ult = l;
+        totalRecebidos++;
+        ultimoRxMs = millis();
+
+        // ACK com o RSSI/SNR medidos aqui
+        delay(30);  // dar tempo do TX entrar em modo RX
+        enviaAck(l.seq, rssi, snr);
+
+        desenhaTelaDados();
+      } else {
+        Serial.println(F("Pacote D invalido"));
+      }
     } else {
-      Serial.println(F("Pacote invalido/desconhecido"));
+      Serial.println(F("Pacote desconhecido (ignorado)"));
     }
   }
 
-  // Tela de espera se nenhum pacote chegou ainda
   if (totalRecebidos == 0) {
     static unsigned long ultimaAtual = 0;
     if (millis() - ultimaAtual > 1000) {

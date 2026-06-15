@@ -85,15 +85,41 @@ Coeficientes `a, b` usados:
 calibracao no boot. Para precisao laboratorial, sensores MQ exigem burn-in de
 24-48 h e calibracao com gas de referencia.
 
-## Pacote LoRa
+## Pacote LoRa + ACK
 
-CSV simples enviado a cada 3 segundos:
+A cada 3 segundos o TX envia um pacote de dados, depois entra em modo escuta
+por 900 ms para receber o ACK do receptor:
 
-```
-seq;mq2_raw;mq2_ppm;mq7_raw;mq7_ppm;mq135_raw;mq135_ppm;temp;umid
-```
+- **Dados (TX -> RX):**
+  ```
+  D;seq;mq2_raw;mq2_ppm;mq7_raw;mq7_ppm;mq135_raw;mq135_ppm;temp;umid
+  ```
+  Exemplo: `D;42;820;12.3;510;8.1;600;450.0;26.4;58.2`
 
-Exemplo: `42;820;12.3;510;8.1;600;450.0;26.4;58.2`
+- **ACK (RX -> TX):** o receptor mede RSSI e SNR do pacote recebido e devolve:
+  ```
+  A;seq;rssi;snr
+  ```
+  Exemplo: `A;42;-72;9.5`
+
+Assim os DOIS ESP32 conseguem mostrar o nivel de sinal:
+- O RX mostra o RSSI/SNR de cada pacote recebido.
+- O TX mostra o RSSI medido no remoto que veio pelo ACK + sua potencia de TX.
+
+## Indicador de intensidade de sinal
+
+Ambos os OLEDs mostram um icone de 4 barras estilo celular no canto superior
+direito. A conversao de RSSI -> barras eh:
+
+| Barras | Faixa RSSI         | Qualidade                 |
+|--------|--------------------|---------------------------|
+| 4 / 4  | >= -75 dBm         | Excelente                 |
+| 3 / 4  | -75 a -90 dBm      | Boa                       |
+| 2 / 4  | -90 a -105 dBm     | Razoavel                  |
+| 1 / 4  | -105 a -120 dBm    | Marginal                  |
+| 0 / 4  | < -120 dBm / sem ACK | Sem sinal / fora de alcance |
+
+Alem das barras, cada display mostra o valor numerico em dBm na ultima linha.
 
 Parametros LoRa fixos nos dois lados:
 - Frequencia: 915 MHz
@@ -144,22 +170,24 @@ arduino-cli upload  --fqbn esp32:esp32:heltec_wifi_lora_32_V2 -p COM10 Receptor
 
 ### Transmissor (OLED)
 ```
-TX #42  OK
------------------------
+TX #42 OK            [|||| ]   <- barras = sinal medido no RX
+----------------------------
 MQ2   820 12ppm
 MQ7   510  8ppm
 MQ135 600 450ppm
-T:26.4°C  H:58%
+T:26.4°C H:58%
+Tx:17dB Rx:-72dBm
 ```
 
 ### Receptor (OLED)
 ```
-RX #42  Tot:37
------------------------
+RX #42 T:37          [|||| ]   <- barras = RSSI local
+----------------------------
 MQ2   820 12ppm
 MQ7   510  8ppm
 MQ135 600 450ppm
-T:26.4°C H:58% R-72
+T:26.4°C H:58%
+R:-72dBm S:9.5dB
 ```
 
 Os dois Serial Monitor (115200 baud) tambem mostram tudo: o transmissor imprime
