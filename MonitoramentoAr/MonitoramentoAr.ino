@@ -5,20 +5,22 @@
  * Placa : Heltec WiFi LoRa 32 V2 (ESP32 + OLED SSD1306 + SX1276)
  * Porta : COM9
  *
- * Funcao deste firmware:
- *   1) Le 4 sensores: MQ2, MQ7, MQ135 e DHT22.
- *   2) Calcula a resistencia interna RS dos sensores MQ.
- *   3) Auto-calibra R0 (resistencia em ar limpo) na inicializacao.
- *   4) Converte RS/R0 em ppm usando as curvas dos datasheets.
- *   5) Envia tudo via LoRa em 915 MHz para o receptor (COM10).
- *   6) Aguarda ACK do receptor com o RSSI/SNR medido remotamente.
- *   7) Mostra valores + barras de intensidade do enlace no OLED.
+ * Funcao:
+ *   1) Le 3 sensores MQ (MQ2, MQ7, MQ135) + 4 DHT22.
+ *   2) Auto-calibra R0 dos MQ em ar limpo na inicializacao.
+ *   3) Converte RS/R0 em ppm usando as curvas dos datasheets.
+ *   4) Envia tudo via LoRa em 915 MHz para o receptor (COM10).
+ *   5) Aguarda ACK com o RSSI/SNR medidos remotamente.
+ *   6) Mostra dados + barras de intensidade + dBm no OLED.
  *
  * Conexoes dos sensores:
- *   MQ2   -> GPIO 33  (analogico) - Gas inflamavel / Fumaca (curva GLP)
- *   MQ7   -> GPIO 32  (analogico) - Monoxido de Carbono (CO)
- *   MQ135 -> GPIO 36  (analogico) - Qualidade do ar (curva CO2)
- *   DHT22 -> GPIO 23  (digital)   - Temperatura e Umidade
+ *   MQ2   -> GPIO 33 (analogico)
+ *   MQ7   -> GPIO 32 (analogico)
+ *   MQ135 -> GPIO 36 (analogico)
+ *   DHT22 #1 -> GPIO 17 (digital)
+ *   DHT22 #2 -> GPIO 22 (digital)
+ *   DHT22 #3 -> GPIO 23 (digital)
+ *   DHT22 #4 -> GPIO 25 (digital)
  *
  * OLED Heltec V2:  SDA=4  SCL=15  RST=16  I2C=0x3C
  * LoRa  Heltec V2: SCK=5  MISO=19 MOSI=27 SS=18 RST=14 DIO0=26
@@ -37,11 +39,16 @@
 #include <LoRa.h>
 #include <math.h>
 
-// ===== Pinos dos sensores =====
+// ===== Pinos MQ =====
 #define PIN_MQ2     33
 #define PIN_MQ7     32
 #define PIN_MQ135   36
-#define PIN_DHT22   23
+
+// ===== 4 x DHT22 =====
+#define PIN_DHT1    17
+#define PIN_DHT2    22
+#define PIN_DHT3    23
+#define PIN_DHT4    25
 #define DHTTYPE     DHT22
 
 // ===== OLED Heltec =====
@@ -66,7 +73,7 @@
 #define LORA_SYNC   0xA5
 #define ACK_TIMEOUT_MS  900
 
-// ===== Calibracao =====
+// ===== Calibracao MQ =====
 #define VCC_SENSOR     3.3
 #define VREF_ADC       3.3
 #define ADC_RES        4095.0
@@ -88,23 +95,30 @@
 #define AMOSTRAS_CAL     50
 #define INTERVALO_TX_MS  3000
 
-// ===== Globais =====
+// ============================================================
+// Globais
+// ============================================================
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
-DHT dht(PIN_DHT22, DHTTYPE);
+
+DHT dht1(PIN_DHT1, DHTTYPE);
+DHT dht2(PIN_DHT2, DHTTYPE);
+DHT dht3(PIN_DHT3, DHTTYPE);
+DHT dht4(PIN_DHT4, DHTTYPE);
+DHT* dhts[4] = { &dht1, &dht2, &dht3, &dht4 };
+const int  dhtPinos[4]  = { PIN_DHT1, PIN_DHT2, PIN_DHT3, PIN_DHT4 };
+const char dhtRotulos[4][4] = { "S1", "S2", "S3", "S4" };
 
 float r0_mq2 = 10.0, r0_mq7 = 10.0, r0_mq135 = 10.0;
 
 uint32_t pacoteSeq    = 0;
 unsigned long ultimoTx = 0;
 
-// Qualidade do enlace (medido no receptor e devolvido por ACK)
-int   linkRssi      = -200;   // dBm reportado pelo RX
-float linkSnr       = 0.0;    // dB reportado pelo RX
-bool  linkOk        = false;  // true se o ultimo ACK chegou
-uint32_t ultimoAckSeq = 0;
+int   linkRssi = -200;
+float linkSnr  = 0.0;
+bool  linkOk   = false;
 
 // ============================================================
-// Funcoes de calculo dos sensores
+// Funcoes de calculo (MQ)
 // ============================================================
 
 float adcParaTensao(int adc) {
@@ -125,10 +139,7 @@ float calibrarR0(int pin, float ratioArLimpo, int amostras) {
   for (int i = 0; i < amostras; i++) {
     int adc = analogRead(pin);
     float rs = calcularRS(adc);
-    if (rs > 0) {
-      somaRS += rs;
-      validas++;
-    }
+    if (rs > 0) { somaRS += rs; validas++; }
     delay(100);
   }
   if (validas == 0) return -1.0;
@@ -144,7 +155,6 @@ float calcularPPM(float rs, float r0, float a, float b) {
 // Indicador de sinal
 // ============================================================
 
-// Converte RSSI (dBm) em numero de barras (0..4).
 int rssiParaBarras(int rssi, bool valido) {
   if (!valido) return 0;
   if (rssi >= -75)  return 4;
@@ -154,8 +164,6 @@ int rssiParaBarras(int rssi, bool valido) {
   return 0;
 }
 
-// Desenha 4 barras estilo celular alinhadas pela base em (x, y_base).
-// Largura total: 15 px, altura maxima: 12 px.
 void desenhaBarras(int x, int y_base, int bars) {
   const int heights[4] = {3, 6, 9, 12};
   const int bar_w = 3;
@@ -164,11 +172,8 @@ void desenhaBarras(int x, int y_base, int bars) {
     int bx = x + i * (bar_w + gap);
     int bh = heights[i];
     int by = y_base - bh;
-    if (i < bars) {
-      display.fillRect(bx, by, bar_w, bh, SSD1306_WHITE);
-    } else {
-      display.drawRect(bx, by, bar_w, bh, SSD1306_WHITE);
-    }
+    if (i < bars) display.fillRect(bx, by, bar_w, bh, SSD1306_WHITE);
+    else          display.drawRect(bx, by, bar_w, bh, SSD1306_WHITE);
   }
 }
 
@@ -190,13 +195,10 @@ void mostraMsg(const char* l1, const char* l2 = "", const char* l3 = "", const c
 
 void inicializaOLED() {
   pinMode(21, OUTPUT);
-  digitalWrite(21, LOW);   // Vext ON
-  delay(50);
-
+  digitalWrite(21, LOW);   delay(50);
   pinMode(OLED_RST, OUTPUT);
-  digitalWrite(OLED_RST, LOW);  delay(20);
+  digitalWrite(OLED_RST, LOW);   delay(20);
   digitalWrite(OLED_RST, HIGH);
-
   Wire.begin(OLED_SDA, OLED_SCL);
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
     Serial.println(F("Falha OLED"));
@@ -223,8 +225,6 @@ void inicializaLoRa() {
   LoRa.enableCrc();
 }
 
-// Aguarda ACK do receptor: formato "A;seq;rssi;snr".
-// Retorna true se ACK chegou, e preenche linkRssi/linkSnr.
 bool aguardaAck(uint32_t seqEsperado) {
   LoRa.receive();
   unsigned long t0 = millis();
@@ -239,12 +239,9 @@ bool aguardaAck(uint32_t seqEsperado) {
         int p2 = (p1 > 0) ? ack.indexOf(';', p1 + 1) : -1;
         if (p1 > 0 && p2 > 0) {
           uint32_t s = (uint32_t)ack.substring(2, p1).toInt();
-          int r = ack.substring(p1 + 1, p2).toInt();
-          float sn = ack.substring(p2 + 1).toFloat();
           if (s == seqEsperado) {
-            linkRssi = r;
-            linkSnr = sn;
-            ultimoAckSeq = s;
+            linkRssi = ack.substring(p1 + 1, p2).toInt();
+            linkSnr  = ack.substring(p2 + 1).toFloat();
             return true;
           }
         }
@@ -256,7 +253,7 @@ bool aguardaAck(uint32_t seqEsperado) {
 }
 
 // ============================================================
-// Boot
+// Boot: warmup + calibracao
 // ============================================================
 
 void warmupSensores() {
@@ -268,17 +265,16 @@ void warmupSensores() {
     display.println(F("INICIALIZANDO"));
     display.drawLine(0, 9, SCREEN_WIDTH - 1, 9, SSD1306_WHITE);
     display.setCursor(0, 14);
-    display.println(F("Aguarde aquecimento"));
-    display.println(F("dos sensores MQ."));
+    display.println(F("Aquecendo sensores"));
+    display.println(F("MQ (ar limpo!)"));
     display.println();
     display.println(linha);
-    display.println(F("Em ar limpo!"));
     display.display();
     delay(1000);
   }
 }
 
-void calibraTodos() {
+void calibraMQs() {
   mostraMsg("Calibrando R0...", "Manter em", "AR LIMPO!", "");
   Serial.println(F("Calibrando R0 em ar limpo..."));
   r0_mq2   = calibrarR0(PIN_MQ2,   RATIO_CLEAN_MQ2,   AMOSTRAS_CAL);
@@ -297,14 +293,14 @@ void calibraTodos() {
 }
 
 // ============================================================
-// Setup
+// Setup / Loop
 // ============================================================
 
 void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println();
-  Serial.println(F("=== TX LoRa - Monitoramento do Ar ==="));
+  Serial.println(F("=== TX LoRa - Monitoramento do Ar (3 MQ + 4 DHT22) ==="));
 
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
@@ -313,29 +309,27 @@ void setup() {
   pinMode(PIN_MQ7,   INPUT);
   pinMode(PIN_MQ135, INPUT);
 
-  dht.begin();
+  for (int i = 0; i < 4; i++) dhts[i]->begin();
+
   inicializaOLED();
-  mostraMsg("Transmissor", "ESP32 LoRa", "Iniciando...", "");
+  mostraMsg("Transmissor", "ESP32 LoRa", "3 MQ + 4 DHT22", "Iniciando...");
 
   inicializaLoRa();
   Serial.println(F("LoRa OK"));
 
   warmupSensores();
-  calibraTodos();
+  calibraMQs();
 
   mostraMsg("Pronto!", "Transmitindo...", "", "");
   delay(1000);
 }
-
-// ============================================================
-// Loop
-// ============================================================
 
 void loop() {
   unsigned long agora = millis();
   if (agora - ultimoTx < INTERVALO_TX_MS) return;
   ultimoTx = agora;
 
+  // ---------- MQ ----------
   int adcMQ2   = analogRead(PIN_MQ2);
   int adcMQ7   = analogRead(PIN_MQ7);
   int adcMQ135 = analogRead(PIN_MQ135);
@@ -348,22 +342,31 @@ void loop() {
   float ppmMQ7   = calcularPPM(rsMQ7,   r0_mq7,   MQ7_A,   MQ7_B);
   float ppmMQ135 = calcularPPM(rsMQ135, r0_mq135, MQ135_A, MQ135_B);
 
-  float temp = dht.readTemperature();
-  float umid = dht.readHumidity();
-  if (isnan(temp)) temp = -99.0;
-  if (isnan(umid)) umid = -1.0;
+  // ---------- 4 DHT22 ----------
+  float temps[4], umids[4];
+  for (int i = 0; i < 4; i++) {
+    float t = dhts[i]->readTemperature();
+    float h = dhts[i]->readHumidity();
+    temps[i] = isnan(t) ? -99.0f : t;
+    umids[i] = isnan(h) ? -1.0f  : h;
+  }
 
   pacoteSeq++;
 
-  // Pacote: "D;seq;mq2_raw;mq2_ppm;mq7_raw;mq7_ppm;mq135_raw;mq135_ppm;temp;umid"
-  char pacote[140];
+  // Pacote CSV:
+  // D;seq;mq2r;mq2p;mq7r;mq7p;m135r;m135p;t1;h1;t2;h2;t3;h3;t4;h4
+  char pacote[180];
   snprintf(pacote, sizeof(pacote),
-           "D;%lu;%d;%.1f;%d;%.1f;%d;%.1f;%.1f;%.1f",
+           "D;%lu;%d;%.1f;%d;%.1f;%d;%.1f;"
+           "%.1f;%.1f;%.1f;%.1f;%.1f;%.1f;%.1f;%.1f",
            (unsigned long)pacoteSeq,
-           adcMQ2,   ppmMQ2,
-           adcMQ7,   ppmMQ7,
+           adcMQ2, ppmMQ2,
+           adcMQ7, ppmMQ7,
            adcMQ135, ppmMQ135,
-           temp,     umid);
+           temps[0], umids[0],
+           temps[1], umids[1],
+           temps[2], umids[2],
+           temps[3], umids[3]);
 
   LoRa.beginPacket();
   LoRa.print(pacote);
@@ -374,20 +377,21 @@ void loop() {
   // ---------- Log Serial ----------
   Serial.print(F("[#")); Serial.print(pacoteSeq);
   Serial.print(F("] ")); Serial.println(pacote);
-  Serial.print(F("  RS  MQ2/MQ7/MQ135 = "));
-  Serial.print(rsMQ2, 2);   Serial.print(F(" / "));
-  Serial.print(rsMQ7, 2);   Serial.print(F(" / "));
-  Serial.println(rsMQ135, 2);
-  Serial.print(F("  TX status: "));
-  Serial.print(enviou ? F("OK") : F("FALHA"));
+  for (int i = 0; i < 4; i++) {
+    Serial.print(F("  ")); Serial.print(dhtRotulos[i]);
+    Serial.print(F(" (GPIO")); Serial.print(dhtPinos[i]); Serial.print(F("): "));
+    if (temps[i] < -50) { Serial.println(F("ERRO leitura DHT")); }
+    else {
+      Serial.print(temps[i], 1); Serial.print(F(" C  "));
+      Serial.print(umids[i], 1); Serial.println(F(" %"));
+    }
+  }
+  Serial.print(F("  TX: ")); Serial.print(enviou ? F("OK") : F("FALHA"));
   Serial.print(F("  ACK: "));
   if (linkOk) {
     Serial.print(F("RSSI=")); Serial.print(linkRssi);
-    Serial.print(F("dBm SNR=")); Serial.print(linkSnr, 1);
-    Serial.println(F("dB"));
-  } else {
-    Serial.println(F("sem resposta"));
-  }
+    Serial.print(F("dBm SNR=")); Serial.print(linkSnr, 1); Serial.println(F("dB"));
+  } else Serial.println(F("sem resposta"));
 
   // ---------- OLED ----------
   int barras = rssiParaBarras(linkRssi, linkOk);
@@ -396,37 +400,43 @@ void loop() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  // Cabecalho + barras (canto sup. dir.)
+  // Cabecalho + barras
   display.setCursor(0, 0);
   display.print(F("TX #")); display.print(pacoteSeq);
   display.print(F(" ")); display.print(enviou ? F("OK") : F("ER"));
   desenhaBarras(111, 12, barras);
   display.drawLine(0, 14, SCREEN_WIDTH - 1, 14, SSD1306_WHITE);
 
-  // Linhas de dados
-  display.setCursor(0, 17);
+  // Dados
+  display.setCursor(0, 16);
   display.print(F("MQ2  ")); display.print(adcMQ2);
   display.print(F(" ")); display.print(ppmMQ2, 0); display.println(F("ppm"));
 
   display.print(F("MQ7  ")); display.print(adcMQ7);
   display.print(F(" ")); display.print(ppmMQ7, 0); display.println(F("ppm"));
 
-  display.print(F("MQ135 ")); display.print(adcMQ135);
+  display.print(F("M135 ")); display.print(adcMQ135);
   display.print(F(" ")); display.print(ppmMQ135, 0); display.println(F("ppm"));
 
-  display.print(F("T:")); display.print(temp, 1);
-  display.print((char)247); display.print(F("C H:"));
-  display.print(umid, 0); display.println(F("%"));
-
-  // Linha de qualidade do enlace
-  display.setCursor(0, 56);
-  display.print(F("Tx:")); display.print(LORA_TXPOW); display.print(F("dB "));
-  if (linkOk) {
-    display.print(F("Rx:")); display.print(linkRssi); display.print(F("dBm"));
-  } else {
-    display.print(F("Rx: sem ACK"));
+  display.print(F("T "));
+  for (int i = 0; i < 4; i++) {
+    if (temps[i] < -50) display.print(F("-- "));
+    else { display.print((int)round(temps[i])); display.print(F(" ")); }
   }
-  display.display();
+  display.println();
 
+  display.print(F("H "));
+  for (int i = 0; i < 4; i++) {
+    if (umids[i] < 0) display.print(F("-- "));
+    else { display.print((int)round(umids[i])); display.print(F(" ")); }
+  }
+  display.println();
+
+  // Sinal
+  display.print(F("Tx:")); display.print(LORA_TXPOW); display.print(F("dB "));
+  if (linkOk) { display.print(F("Rx:")); display.print(linkRssi); display.print(F("dBm")); }
+  else        { display.print(F("sem ACK")); }
+
+  display.display();
   LoRa.idle();
 }
